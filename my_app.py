@@ -1,5 +1,3 @@
-# TODO: trans_id или transaction_id
-
 import psycopg2
 import pandas as pd
 import os
@@ -74,6 +72,7 @@ def load_data_from_files(path, date):
 
 
 def init_stg():
+    # Инициализация стейджинговых таблиц
     query = '''
     CREATE TABLE if not exists stg_passport_blacklist(
         passport_num varchar(128),
@@ -82,7 +81,7 @@ def init_stg():
 
     CREATE TABLE if not exists stg_transactions(
         trans_id varchar(128),
-        trans_date date,
+        trans_date timestamp,
         card_num varchar(128),
         oper_type varchar(128),
         amt decimal,
@@ -120,7 +119,7 @@ def init_fact_trans():
     query = '''
     CREATE TABLE if not exists dwh_fact_transactions(
         trans_id varchar(128),
-        trans_date date,
+        trans_date timestamp,
         card_num varchar(128),
         oper_type varchar(128),
         amt decimal,
@@ -172,18 +171,17 @@ def create_stg_changed():
     CREATE TABLE stg_terminals_changed as
         SELECT t1.*
         FROM stg_terminals t1
-        INNER JOIN dwh_dim_terminals_hist t2
-        ON t1.terminal_id = t2.terminal_id
-        AND (
-        t1.terminal_city <> t2.terminal_city OR
-        t1.terminal_address <> t2.terminal_address
-        );
+            INNER JOIN dwh_dim_terminals_hist t2
+                ON t1.terminal_id = t2.terminal_id
+                AND t1.terminal_address <> t2.terminal_address
+                AND t2.deleted_flg = 0
     '''
     cursor.execute(query)
     conn.commit()
 
 
 def create_stg_deleted():
+    # Логическое удаление терминалов
     query = '''
         CREATE TABLE stg_terminals_deleted as
         SELECT t1.*
@@ -197,7 +195,7 @@ def create_stg_deleted():
 
 
 def merge_stg_new():
-    # TODO: исправить entry_dt
+    # Внести изменения из stg таблиц с новыми записями
     query = f'''
         INSERT INTO dwh_fact_passport_blacklist(
             passport_num,
@@ -265,12 +263,26 @@ def merge_stg_new():
 def merge_stg_changed():
     # Обновление измененных данных
     query = '''
-        UPDATE dwh_dim_terminals_hist
-        SET terminal_city = t2.terminal_city,
-            terminal_address = t2.terminal_address
-        FROM dwh_dim_terminals_hist t1
-            INNER JOIN stg_terminals_changed t2
-                ON t1.terminal_id = t2.terminal_id
+        UPDATE dwh_dim_terminals_hist t1
+        SET effective_to = current_timestamp - interval '1' second,
+        deleted_flg = 1
+        FROM stg_terminals_changed t2
+        WHERE t1.terminal_id = t2.terminal_id and 
+        (t1.terminal_city <> t2.terminal_city or
+        t1.terminal_address <> t2.terminal_address)
+    '''
+    cursor.execute(query)
+    query = '''
+    INSERT INTO dwh_dim_terminals_hist(
+        terminal_id,
+        terminal_type,
+        terminal_city,
+        terminal_address
+    ) SELECT terminal_id,
+        terminal_type,
+        terminal_city,
+        terminal_address
+    FROM stg_terminals_changed
     '''
     cursor.execute(query)
     conn.commit()
@@ -280,7 +292,7 @@ def merge_stg_deleted():
     # Обновление удаленных данных
     query = '''
         UPDATE dwh_dim_terminals_hist
-        SET deleted_flg = 0,
+        SET deleted_flg = 1,
             effective_to = current_timestamp
         WHERE terminal_id IN (SELECT terminal_id FROM stg_terminals_deleted);
     '''
@@ -333,5 +345,245 @@ def etl(path, date):
     conn.commit()
 
 
+def init_fraud_types():
+    # Инициализация таблицы с расшифровкой типов фрода
+    query = '''
+        CREATE TABLE IF NOT EXISTS fraud_types(
+        fraud_id serial primary key,
+        name varchar(128),
+        description text
+        )
+    '''
+    cursor.execute(query)
+    query = '''
+        INSERT INTO fraud_types(
+        fraud_id,
+        name, 
+        description
+        )
+        VALUES 
+        (1, 'invalid_passport', 'Совершение операции при просроченном или заблокированном паспорте'),
+        (2, 'invalid_contract', 'Совершение операции при недействующем договоре'),
+        (3, 'different_cities', 'Совершение операций в разных городах в течение одного часа'),
+        (4, 'selection_of_amount', 'Попытка подбора суммы')
+    '''
+    try:
+        cursor.execute(query)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+
+
+def init_rep_fraud():
+    # Инцицализация отчета по фроду
+    query = '''
+        CREATE TABLE if not exists rep_fraud(
+        event_dt timestamp,
+        passport varchar(128),
+        fio varchar(128),
+        phone varchar(128),
+        event_type varchar(128),
+        report_dt timestamp default current_timestamp);
+    '''
+    cursor.execute(query)
+    conn.commit()
+
+
+def update_rep_fraud(date):
+    date = f'{date[0:2]}-{date[2:4]}-{date[4:]}'
+    # Заблокированный или просроченный паспорт
+    query = f'''
+    INSERT INTO rep_fraud(
+        event_dt,
+        passport,
+        fio,
+        phone,
+        event_type,
+        report_dt
+    )
+    select
+        t1.trans_date event_dt,
+        t4.passport_num,
+        concat(t4.first_name, ' ', t4.last_name) fio,
+        t4.phone,
+        1 event_type,
+        current_timestamp
+    from dwh_fact_transactions t1
+        inner join cards t2
+            on t1.card_num = t2.card_num
+        inner join accounts t3
+            on t2.account = t3.account
+        inner join clients t4
+            on t3.client = t4.client_id
+        left join dwh_fact_passport_blacklist t5
+            on t4.passport_num = t5.passport_num
+    where
+        t1.trans_date > t4.passport_valid_to
+        or t5.passport_num is not null
+        and date(t1.trans_date) = '{date}'
+    '''
+    cursor.execute(query)
+
+    # Истек срок договора
+    query = f'''
+    INSERT INTO rep_fraud(
+        event_dt,
+        passport,
+        fio,
+        phone,
+        event_type,
+        report_dt
+    )
+    select
+        t1.trans_date event_dt,
+        t4.passport_num,
+        concat(t4.first_name, ' ', t4.last_name) fio,
+        t4.phone,
+        2 event_type,
+        current_timestamp
+    from dwh_fact_transactions t1
+        inner join cards t2
+            on t1.card_num = t2.card_num
+        inner join accounts t3
+            on t2.account = t3.account
+        inner join clients t4
+            on t3.client = t4.client_id
+    where
+        t3.valid_to < t1.trans_date
+        and date(t1.trans_date) = '{date}'
+    '''
+    cursor.execute(query)
+
+    # Операции в разных городах
+    query = f'''
+    with q1 as (
+        select
+            t1.trans_date event_dt,
+            lag(t1.trans_date) over (partition by t1.card_num order by t1.trans_date)
+                as event_dt_lag,
+            t4.passport_num,
+            concat(t4.first_name, ' ', t4.last_name) fio,
+            t4.phone,
+            3 event_type,
+            current_timestamp report_dt,
+            t5.terminal_city,
+            lag(t5.terminal_city) over (partition by t1.card_num order by t1.trans_date)
+                as terminal_city_lag
+        from dwh_fact_transactions t1
+            inner join cards t2
+                on t1.card_num = t2.card_num
+            inner join accounts t3
+                on t2.account = t3.account
+            inner join clients t4
+                on t3.client = t4.client_id
+            inner join dwh_dim_terminals_hist t5
+                on t1.terminal = t5.terminal_id
+                    and t1.create_dt < t5.effective_to
+                    and t1.create_dt >= t5.effective_from
+    )
+
+    INSERT INTO rep_fraud(
+        event_dt,
+        passport,
+        fio,
+        phone,
+        event_type,
+        report_dt
+    )
+    select
+        event_dt,
+        passport_num,
+        fio,
+        phone,
+        event_type,
+        report_dt
+    from q1
+    where (event_dt - event_dt_lag) < interval '1' hour
+        and terminal_city != terminal_city_lag
+        and date(event_dt) = '{date}'
+    '''
+    cursor.execute(query)
+
+    # Подбор суммы
+    query = f'''
+    with q1 as (
+        select
+            t1.trans_date event_dt,
+            t1.amt,
+            lag(t1.amt, 1) over (partition by t1.card_num order by t1.trans_date)
+                as amt_lag_1,
+            lag(t1.amt, 2) over (partition by t1.card_num order by t1.trans_date)
+                as amt_lag_2,
+            lag(t1.amt, 3) over (partition by t1.card_num order by t1.trans_date)
+                as amt_lag_3,
+            lag(t1.trans_date, 3) over (partition by t1.card_num order by t1.trans_date)
+                as event_dt_lag_3,
+            t1.oper_result,
+            lag(t1.oper_result, 1) over (partition by t1.card_num order by t1.trans_date)
+                as oper_result_lag_1,
+            lag(t1.oper_result, 2) over (partition by t1.card_num order by t1.trans_date)
+                as oper_result_lag_2,
+            lag(t1.oper_result, 3) over (partition by t1.card_num order by t1.trans_date)
+                as oper_result_lag_3,
+            t4.passport_num,
+            concat(t4.first_name, ' ', t4.last_name) fio,
+            t4.phone,
+            4 event_type,
+            current_timestamp report_dt
+            
+        from dwh_fact_transactions t1
+            inner join cards t2
+                on t1.card_num = t2.card_num
+            inner join accounts t3
+                on t2.account = t3.account
+            inner join clients t4
+                on t3.client = t4.client_id
+    )
+
+    INSERT INTO rep_fraud(
+        event_dt,
+        passport,
+        fio,
+        phone,
+        event_type,
+        report_dt
+    )
+    select
+        event_dt,
+        passport_num,
+        fio,
+        phone,
+        event_type,
+        report_dt
+    from q1
+    where (event_dt - event_dt_lag_3) < interval '20' minute
+        and amt_lag_3 is not null
+        and amt < amt_lag_1
+        and amt_lag_1 < amt_lag_2
+        and amt_lag_2 < amt_lag_3
+        and date(event_dt) = '{date}'
+        and oper_result = 'SUCCESS'
+        and oper_result_lag_1 = 'REJECT'
+        and oper_result_lag_2 = 'REJECT'
+        and oper_result_lag_3 = 'REJECT'
+    '''
+    cursor.execute(query)
+
+    conn.commit()
+
+
+def find_fraud(date):
+    # Находит фрод и вносит записи в БД
+    init_fraud_types()
+    init_rep_fraud()
+    update_rep_fraud(date)
+
+
+def main(date):
+    etl('data', date)
+    find_fraud(date)
+
+
 if __name__ == '__main__':
-    etl('data', '03032021')
+    for i in range(1, 4):
+        main(f'0{i}032021')
